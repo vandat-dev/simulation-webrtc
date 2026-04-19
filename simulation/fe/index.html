@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8"/>
+    <title>WebRTC Edge Viewer</title>
+    <style>
+        body {
+            font-family: monospace;
+            padding: 24px;
+            background: #111;
+            color: #eee;
+        }
+
+        video {
+            display: block;
+            width: 640px;
+            height: 480px;
+            background: #000;
+            margin-top: 16px;
+        }
+
+        #status {
+            margin-top: 8px;
+            font-size: 13px;
+            color: #aaa;
+        }
+    </style>
+</head>
+<body>
+<h2>Edge Viewer</h2>
+<div id="status">Connecting...</div>
+<video id="video" autoplay playsinline muted></video>
+
+<script>
+    // Config: read edge_id and be_url from query params, with fallbacks.
+    // Example: index.html?edge_id=edge-01&be_url=ws://192.168.1.10:9090/ws
+    const params = new URLSearchParams(window.location.search);
+    const edgeId = params.get('edge_id') || 'edge-01';
+    const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const beURL = params.get('be_url') || `${wsProto}//${window.location.host}/ws`;
+    const sessionId = 'sess-' + Math.random().toString(36).slice(2, 11);
+
+    const statusEl = document.getElementById('status');
+    const videoEl = document.getElementById('video');
+
+    function setStatus(msg) {
+        statusEl.textContent = msg;
+        console.log('[status]', msg);
+    }
+
+    // ── WebSocket ────────────────────────────────────────────────────────────
+    const ws = new WebSocket(beURL);
+
+    ws.onopen = () => {
+        setStatus(`WS connected → registering as browser (session=${sessionId}, edge=${edgeId})`);
+        ws.send(JSON.stringify({
+            type: 'register',
+            role: 'browser',
+            edge_id: edgeId,
+            session_id: sessionId,
+        }));
+    };
+
+    ws.onmessage = async (event) => {
+        const msg = JSON.parse(event.data);
+        switch (msg.type) {
+            case 'offer':
+                await handleOffer(msg.sdp);
+                break;
+            case 'ice_candidate':
+                await handleRemoteICE(msg.candidate);
+                break;
+            default:
+                console.warn('[ws] unknown message type:', msg.type);
+        }
+    };
+
+    ws.onclose = () => setStatus('WS disconnected');
+    ws.onerror = (e) => setStatus('WS error: ' + e.message);
+
+    // ── WebRTC ───────────────────────────────────────────────────────────────
+    let pc = null;
+
+    async function handleOffer(sdp) {
+        setStatus('Received offer — creating PeerConnection...');
+
+        pc = new RTCPeerConnection({
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                // { urls: 'stun:192.168.1.9:3478' },
+            ],
+        });
+
+        // Forward gathered ICE candidates to Edge via BE
+        // ===============================//
+        // Temporary comment out
+        pc.onicecandidate = ({ candidate }) => {
+          if (!candidate) return;
+          console.log('[ice] local candidate:', candidate.candidate);
+          ws.send(JSON.stringify({
+            type:       'ice_candidate',
+            session_id: sessionId,
+            candidate:  candidate,
+          }));
+        };
+        // pc.onicecandidate = ({candidate}) => {
+        //     if (!candidate) return;
+        //
+        //     // Bỏ qua mDNS candidates — server không resolve được .local hostname
+        //     if (candidate.candidate.includes('.local')) return;
+        //
+        //     console.log('[ice] local candidate:', candidate.candidate);
+        //     ws.send(JSON.stringify({
+        //         type: 'ice_candidate',
+        //         session_id: sessionId,
+        //         candidate: candidate,
+        //     }));
+        // };
+
+        pc.oniceconnectionstatechange = () => {
+            console.log('[ice] connection state:', pc.iceConnectionState);
+        };
+
+        pc.onconnectionstatechange = () => {
+            setStatus('WebRTC: ' + pc.connectionState);
+            console.log('[webrtc] connection state:', pc.connectionState);
+        };
+
+        // Attach incoming stream to <video>
+        pc.ontrack = ({streams}) => {
+            videoEl.srcObject = streams[0];
+            setStatus('Streaming ▶');
+        };
+
+        await pc.setRemoteDescription({type: 'offer', sdp});
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+
+        ws.send(JSON.stringify({
+            type: 'answer',
+            session_id: sessionId,
+            sdp: answer.sdp,
+        }));
+        setStatus('Answer sent — waiting for ICE...');
+    }
+
+    async function handleRemoteICE(candidate) {
+        if (!pc || !candidate) return;
+        console.log('[ice] remote candidate:', candidate.candidate ?? candidate);
+        try {
+            await pc.addIceCandidate(candidate);
+        } catch (e) {
+            console.warn('[webrtc] addIceCandidate error:', e);
+        }
+    }
+</script>
+</body>
+</html>
